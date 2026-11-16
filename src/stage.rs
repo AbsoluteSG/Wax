@@ -34,9 +34,15 @@ impl App {
         let text_h = 190.0;
         let left = rect.center().x - comp_w * 0.5;
         let top = rect.top() + ((rect.height() - s - text_h) * 0.45).max(28.0);
+        // Idle float: sleeve and record drift on slightly different phases,
+        // so the record seems to hover in front of its sleeve.
+        let t = self.bob_t;
+        let bob = vec2((t * 0.55).sin() * 0.9, (t * 1.2).sin() * 2.4);
+        let bob_disc = vec2((t * 0.55 + 0.7).sin() * 1.3, (t * 1.2 + 0.9).sin() * 3.4);
         let sleeve = Rect::from_min_size(pos2(left, top), vec2(s, s));
         let slide = ease_out(self.slide);
-        let disc = pos2(sleeve.center().x + s * 0.56 * slide, sleeve.center().y);
+        let disc = pos2(sleeve.center().x + s * 0.56 * slide, sleeve.center().y) + bob_disc;
+        let sleeve = sleeve.translate(bob);
 
         let pos_ms = self.engine.shared.pos_ms.load(Ordering::Relaxed);
         let (label, cover, gaps, progress, title) = match &self.now {
@@ -50,7 +56,8 @@ impl App {
             }
             None => (None, None, &[][..], None, ""),
         };
-        paint::vinyl(&p, &Vinyl { center: disc, radius: r, angle: self.angle, label, palette: pal, gaps, progress });
+        let disc_tex = self.disc.get(&ctx, r * ctx.pixels_per_point(), gaps);
+        paint::vinyl(&p, &Vinyl { center: disc, radius: r, angle: self.angle, label, palette: pal, gaps, progress, disc: disc_tex });
         paint::sleeve(&p, sleeve, cover, pal, title, 6.0);
 
         // Scroll over the stage to change volume.

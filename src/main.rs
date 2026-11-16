@@ -3,14 +3,17 @@
 mod actions;
 mod app;
 mod art;
+mod disc;
 mod engine;
 mod library;
 mod mini;
+mod motion;
 mod paint;
 mod platform;
 mod playlist;
 mod save;
 mod shelf;
+mod spectrum;
 mod stage;
 mod stream;
 mod wave;
@@ -32,6 +35,11 @@ fn main() -> eframe::Result {
             .and_then(|i| args.get(i + 1))
             .and_then(|s| s.parse().ok())
             .unwrap_or(2.5),
+        // `--bench <secs>`: play, act as if focused, then write frame stats
+        // to `bench.txt` in the data folder and exit.
+        // `--mini`: start as the floating mini player.
+        mini: args.iter().any(|a| a == "--mini"),
+        bench: args.iter().position(|a| a == "--bench").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()),
     };
 
     let options = eframe::NativeOptions {

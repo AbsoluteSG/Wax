@@ -38,6 +38,8 @@ pub struct Launch {
     pub search: Option<String>,
     /// Seconds after launch to take the `--shot` screenshot.
     pub shot_delay: f32,
+    pub bench: Option<f32>,
+    pub mini: bool,
 }
 
 pub struct Now {
@@ -147,6 +149,19 @@ pub struct App {
     pub mini: bool,
     /// Last session's track was restored, or something else was played first.
     pub resumed: bool,
+    /// --bench: (frames, seconds spent in `ui`).
+    pub bench: (u64, f64),
+    /// --bench: frames repainted because of (window motion, settling animations).
+    pub bench_why: (u64, u64),
+    pub motion: crate::motion::Motion,
+    pub disc: crate::disc::DiscCache,
+    pub spectrum: crate::spectrum::Spectrum,
+    /// Time base for the idle float of the record.
+    pub bob_t: f32,
+    /// Smoothed playback position for scrolling visuals (ms).
+    pub smooth_ms: f64,
+    /// Live loudness per waveform slot for the mini player: (track key, levels).
+    pub live: (u64, Vec<f32>),
 }
 
 pub fn search_id() -> Id {
@@ -162,7 +177,7 @@ impl App {
         let cfg = Config::load();
         let lib = Library::build(library::load_cached_tracks());
         let wake = ctx.clone();
-        let volume = if launch.shot.is_some() { 0.0 } else { cfg.volume };
+        let volume = if launch.shot.is_some() || launch.bench.is_some() { 0.0 } else { cfg.volume };
         let engine = Engine::spawn(move || wake.request_repaint(), volume, cfg.shuffle, cfg.repeat);
         let wake = ctx.clone();
         let default = default_palette();
@@ -207,6 +222,14 @@ impl App {
             saving_ids: HashSet::new(),
             mini: false,
             resumed: false,
+            bench: (0, 0.0),
+            bench_why: (0, 0),
+            motion: Default::default(),
+            disc: Default::default(),
+            spectrum: Default::default(),
+            bob_t: 0.0,
+            smooth_ms: 0.0,
+            live: (0, Vec::new()),
             cfg,
             lib,
             engine,
@@ -221,6 +244,9 @@ impl App {
         }
         if !app.cfg.folders.is_empty() {
             app.rescan(ctx);
+        }
+        if app.launch.mini {
+            app.set_mini(ctx, true);
         }
         app
     }
@@ -835,13 +861,41 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let full = ctx.content_rect();
         self.glass.update(frame, &ctx, if self.mini { full.height() * 0.5 } else { 14.0 });
+        let frame_start = std::time::Instant::now();
         let (dt, time, focused) = ctx.input(|i| (i.stable_dt.min(0.05), i.time as f32, i.focused));
+        let focused = focused || self.launch.bench.is_some();
         self.frames += 1;
 
         self.art.begin_frame(&ctx);
         self.poll(&ctx, time, dt);
         self.keys(&ctx);
         self.refresh_filter(time);
+
+        // Window spring + tilt (tilt only for the full window, not maximised).
+        let (maximized, primary_down) = ctx.input(|i| (i.viewport().maximized.unwrap_or(false), i.pointer.primary_down()));
+        let tilt_on = !self.mini && !maximized;
+        let moving = self.motion.update(frame, time as f64, dt, primary_down, tilt_on, full);
+
+        // A smoothed clock for anything that scrolls with the music.
+        let pos = self.engine.shared.pos_ms.load(Ordering::Relaxed) as f64;
+        if self.playing() {
+            self.smooth_ms += dt as f64 * 1000.0;
+        }
+        if (self.smooth_ms - pos).abs() > 250.0 || !self.playing() {
+            self.smooth_ms = pos;
+        } else {
+            self.smooth_ms += (pos - self.smooth_ms) * 0.08;
+        }
+
+        // The record floats gently while the window has focus or music plays.
+        let bobbing = focused || self.playing();
+        if bobbing {
+            self.bob_t += dt;
+        }
+
+        let layer = ui.layer_id();
+        let shapes_now = |ctx: &egui::Context| ctx.graphics(|g| g.get(layer).map_or(0, |l| l.next_idx().0));
+        let mut keep_flat: Vec<(usize, usize)> = Vec::new();
 
         if self.mini {
             self.mini_view(ui, full, time);
@@ -852,12 +906,14 @@ impl eframe::App for App {
             let tint = paint::lerp_color(Color32::from_rgb(12, 13, 18), self.palette().b, 0.12);
             ui.painter().rect_filled(full, wr, Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), 168));
             ui.painter().rect_stroke(full, wr, Stroke::new(1.0, Color32::from_white_alpha(20)), egui::StrokeKind::Inside);
+            // The glass pane stays put; the cards on it lean.
+            keep_flat.push((0, shapes_now(&ctx)));
 
             // The title band drags the window; registered first so real widgets win.
             let strip = Rect::from_min_size(full.min, vec2(full.width(), TOP));
             let drag = ui.interact(strip, Id::unique("wax-titlebar"), Sense::click_and_drag());
-            if drag.drag_started() {
-                ctx.send_viewport_cmd(ViewportCommand::StartDrag);
+            if drag.drag_started() && !maximized {
+                self.motion.begin_drag();
             }
             if drag.double_clicked() {
                 ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
@@ -872,19 +928,61 @@ impl eframe::App for App {
             self.stage(ui, stage, time);
             self.shelf(ui, shelf, time);
             self.dock(ui, dock, time);
+            let chrome = shapes_now(&ctx);
             self.window_chrome(ui, full);
+            keep_flat.push((chrome, shapes_now(&ctx)));
             self.show_pending_menu(&ctx, time);
         }
         self.overlays(ui, full, time);
+        if tilt_on {
+            self.motion.warp_layer(&ctx, layer, &keep_flat);
+        } else {
+            self.motion.warp = None;
+        }
 
-        // Only keep painting while something is actually moving.
-        let settling = self.spin > 0.01 || self.slide < 1.0 || (time - self.peaks_at) < 0.8;
-        if self.playing() || settling {
-            if focused {
-                ctx.request_repaint();
-            } else {
-                ctx.request_repaint_after(Duration::from_millis(33));
+        if let Some(secs) = self.launch.bench {
+            self.bench.0 += 1;
+            self.bench.1 += frame_start.elapsed().as_secs_f64();
+            if time >= secs {
+                let (frames, ui_s) = self.bench;
+                let max_band = self.spectrum.bands.iter().cloned().fold(0.0f32, f32::max);
+                let line = format!(
+                    "frames={frames} fps={:.1} ui_ms_per_frame={:.3} energy={:.2} max_band={:.2} motion={} settling={}
+",
+                    frames as f32 / time,
+                    ui_s * 1000.0 / frames as f64,
+                    self.spectrum.energy,
+                    max_band,
+                    self.bench_why.0,
+                    self.bench_why.1
+                );
+                let _ = std::fs::write(library::data_dir().join("bench.txt"), line);
+                std::process::exit(0);
             }
+        }
+
+        // Repaint only while something moves, and no faster than it needs:
+        // full refresh while the window itself is moving; otherwise an even
+        // divisor of the display rate near 60 fps (30 when in the background
+        // or when only the idle float is moving). Nothing at all when still.
+        let settling = self.spin > 0.01 || self.slide < 1.0 || (time - self.peaks_at) < 0.8 || !self.spectrum.resting();
+        let hz = self.motion.refresh_hz();
+        let pace = |fps: f32| {
+            let every = (hz / fps).round().max(1.0);
+            // Ask a little early so the frame is ready for that vblank.
+            Duration::from_secs_f32((every / hz - 0.0015).max(0.001))
+        };
+        if self.launch.bench.is_some() {
+            self.bench_why.0 += moving as u64;
+            self.bench_why.1 += settling as u64;
+        }
+        if moving {
+            // Every refresh while the window itself moves: it should glide.
+            ctx.request_repaint();
+        } else if self.playing() || settling {
+            ctx.request_repaint_after(pace(if focused { 60.0 } else { 30.0 }));
+        } else if bobbing {
+            ctx.request_repaint_after(pace(30.0));
         }
 
         if let Some(path) = self.launch.shot.clone() {
@@ -903,6 +1001,10 @@ impl eframe::App for App {
                 });
             }
         }
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.motion.unwarp_input(ctx, raw_input);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

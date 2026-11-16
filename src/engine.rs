@@ -47,6 +47,46 @@ pub struct Shared {
     /// Smoothed output level 0..1 as f32 bits, written from the audio thread.
     pub level: AtomicU32,
     pub error: Mutex<Option<String>>,
+    /// The most recent output, mixed to mono, for the live visuals.
+    pub scope: Scope,
+}
+
+/// A lock-free ring of recent mono samples. The audio thread only ever does
+/// relaxed atomic stores into it, so it can never block playback.
+pub struct Scope {
+    buf: Box<[AtomicU32]>,
+    head: std::sync::atomic::AtomicUsize,
+    pub rate: AtomicU32,
+}
+
+pub const SCOPE_LEN: usize = 2048;
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self { buf: (0..SCOPE_LEN).map(|_| AtomicU32::new(0)).collect(), head: Default::default(), rate: AtomicU32::new(44_100) }
+    }
+}
+
+impl Scope {
+    #[inline]
+    pub(crate) fn push(&self, v: f32) {
+        let h = self.head.load(Ordering::Relaxed);
+        self.buf[h & (SCOPE_LEN - 1)].store(v.to_bits(), Ordering::Relaxed);
+        self.head.store(h.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Copy the newest `out.len()` samples, oldest first. Returns the write
+    /// position, so callers can tell whether anything new arrived.
+    pub fn latest(&self, out: &mut [f32]) -> usize {
+        let h = self.head.load(Ordering::Acquire);
+        let n = out.len().min(SCOPE_LEN);
+        for (i, o) in out.iter_mut().take(n).enumerate() {
+            let idx = h.wrapping_sub(n - i) & (SCOPE_LEN - 1);
+            *o = f32::from_bits(self.buf[idx].load(Ordering::Relaxed));
+        }
+        h
+    }
+
 }
 
 impl Shared {
@@ -512,11 +552,16 @@ struct LevelTap<S> {
     peak: f32,
     count: u32,
     smooth: f32,
+    channels: u16,
+    ch: u16,
+    mix: f32,
 }
 
-impl<S> LevelTap<S> {
+impl<S: Source> LevelTap<S> {
     fn new(inner: S, shared: Arc<Shared>) -> Self {
-        Self { inner, shared, peak: 0.0, count: 0, smooth: 0.0 }
+        let channels = inner.channels().get();
+        shared.scope.rate.store(inner.sample_rate().get(), Ordering::Relaxed);
+        Self { inner, shared, peak: 0.0, count: 0, smooth: 0.0, channels, ch: 0, mix: 0.0 }
     }
 }
 
@@ -527,8 +572,17 @@ impl<S: Source> Iterator for LevelTap<S> {
     fn next(&mut self) -> Option<Sample> {
         let s = self.inner.next()?;
         self.peak = self.peak.max(s.abs());
+        // Mix each frame to mono for the scope.
+        self.mix += s;
+        self.ch += 1;
+        if self.ch >= self.channels {
+            self.shared.scope.push(self.mix / self.channels as f32);
+            self.mix = 0.0;
+            self.ch = 0;
+        }
         self.count += 1;
         if self.count >= 2048 {
+            self.channels = self.inner.channels().get();
             // Fast attack, slow release.
             let k = if self.peak > self.smooth { 0.6 } else { 0.12 };
             self.smooth += (self.peak - self.smooth) * k;

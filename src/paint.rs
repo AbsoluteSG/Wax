@@ -179,14 +179,33 @@ pub struct Vinyl<'a> {
     pub gaps: &'a [f32],
     /// Where the "needle" is, 0..1 across the side.
     pub progress: Option<f32>,
+    /// Pre-rendered grooves/sheen/shadow (see `disc.rs`); drawn as vectors without it.
+    pub disc: Option<TextureId>,
 }
 
 /// Radii of the grooved area, as fractions of the disc radius.
-const GROOVE_OUT: f32 = 0.955;
-const GROOVE_IN: f32 = 0.43;
-const LABEL: f32 = 0.36;
+use crate::disc::{GROOVE_IN, GROOVE_OUT, LABEL};
 
 pub fn vinyl(p: &Painter, v: &Vinyl) {
+    let (c, r) = (v.center, v.radius);
+    let span = GROOVE_OUT - GROOVE_IN;
+    match v.disc {
+        Some(tex) => {
+            // One textured quad: shadow, grooves, gaps, sheen and rim.
+            let rect = Rect::from_center_size(c, vec2(r, r) * (2.0 * crate::disc::EXTENT));
+            p.image(tex, rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => vinyl_vectors(p, v),
+    }
+    if let Some(pr) = v.progress {
+        let pr = pr.clamp(0.0, 1.0);
+        p.circle_stroke(c, r * (GROOVE_OUT - span * pr), Stroke::new(1.5, alpha(v.palette.a, 0.9)));
+    }
+    vinyl_label(p, v);
+}
+
+/// The same disc drawn with shapes, used until its texture is ready.
+fn vinyl_vectors(p: &Painter, v: &Vinyl) {
     let (c, r) = (v.center, v.radius);
 
     // Drop shadow, offset down-right.
@@ -209,10 +228,6 @@ pub fn vinyl(p: &Painter, v: &Vinyl) {
             p.circle_stroke(c, r * (GROOVE_OUT - span * g), Stroke::new((r * 0.012).max(1.5), Color32::from_rgb(5, 5, 6)));
         }
     }
-    if let Some(pr) = v.progress {
-        let pr = pr.clamp(0.0, 1.0);
-        p.circle_stroke(c, r * (GROOVE_OUT - span * pr), Stroke::new(1.5, alpha(v.palette.a, 0.9)));
-    }
 
     // Light catching the grooves: two fixed wedges, so the label visibly
     // spins underneath while the sheen stays put.
@@ -223,7 +238,10 @@ pub fn vinyl(p: &Painter, v: &Vinyl) {
         (alpha(w, 0.55), w)
     })));
     p.circle_stroke(c, r - 0.5, Stroke::new(1.0, Color32::from_white_alpha(26)));
+}
 
+fn vinyl_label(p: &Painter, v: &Vinyl) {
+    let (c, r) = (v.center, v.radius);
     // Label.
     let lr = r * LABEL;
     match v.label {
