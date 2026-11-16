@@ -4,6 +4,8 @@ A record-player style music player for Windows, written in Rust with [egui](http
 
 Your collection sits on a shelf as album sleeves. Pick one and it plays on the platter, with a waveform strip along the bottom of the window.
 
+![Wax](assets/screenshot.png)
+
 ## Download
 
 Grab `wax.exe` from the [latest release](../../releases/latest) and run it. You don't need to install anything.
